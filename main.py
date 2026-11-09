@@ -28,7 +28,7 @@ if __name__ == "__main__":
     print(failed)
 
     print("\nFailed attempts with invalid user:")
-    print(invalid)
+    print(sum(invalid.values()), "attempts,", len(invalid), "different usernames")
 
     print("\nGenerating dashboard...")
 
