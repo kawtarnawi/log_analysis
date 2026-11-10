@@ -1,81 +1,152 @@
 
 import requests as http
-import json
-import os
-import logging
+import ipaddress
 
-logger = logging.getLogger(__name__)
+from logger_config import app_logger
+from storage import cache_db
 
-# the cache is next to main.py, whatever folder the program is started from
-CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "country_cache.json")
 
-# returned when ipinfo answers 429 (too many requests)
+# Remplacer par ton token personnel IPinfo
+TOKEN = "b6b9f02d87e8d2"
+
 LIMIT = "limit"
 
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            logger.error("country_cache.json is unreadable, starting with an empty cache")
-            return {}
-
-    return {}
+# Cache en mémoire
+country_cache = {}
 
 
-def save_cache():
+def initialize_cache():
+    """Charger le cache PostgreSQL au démarrage."""
+    global country_cache
+
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(country_cache, f)
-    except OSError as e:
-        logger.error("Cannot save the cache: %s", e)
+        country_cache = cache_db.load_cache()
 
+        app_logger.info(
+            "Cache chargé depuis PostgreSQL : %d IP connues",
+            len(country_cache)
+        )
 
-country_cache = load_cache()
+    except Exception as e:
+        app_logger.error("Erreur initialisation du cache : %s", e)
+        country_cache = {}
 
 
 def geo_location(ip):
-    # returns the country code, "Unknown" if ipinfo has no country,
-    # None if ipinfo did not answer (the ip will be retried next time) or LIMIT on a 429
+    """
+    Rechercher le pays d'une IP :
+    1. Cache mémoire
+    2. PostgreSQL
+    3. Vérification IP
+    4. API IPinfo
+    5. Sauvegarde PostgreSQL
+    """
 
+    # 1. Vérifier le cache mémoire
     if ip in country_cache:
         return country_cache[ip]
 
+    # 2. Vérifier PostgreSQL
+    country = cache_db.get_country(ip)
+
+    if country is not None:
+        country_cache[ip] = country
+        return country
+
+    # 3. Vérifier la validité de l'adresse IP
     try:
-        response = http.get("https://ipinfo.io/" + ip + "/json", timeout=5)
+        address = ipaddress.ip_address(ip)
+
+    except ValueError:
+        app_logger.error("Adresse IP invalide : %s", ip)
+        return "Unknown"
+
+    # 4. Ignorer les IP privées et non publiques
+    if not address.is_global:
+        country_cache[ip] = "Private"
+        cache_db.save_ip(ip, "Private")
+
+        app_logger.info("IP privée ou non publique ignorée : %s", ip)
+        return "Private"
+
+    # 5. Appeler IPinfo pour les IP publiques
+    try:
+        response = http.get(
+            "https://ipinfo.io/" + ip + "/json",
+            params={"token": TOKEN},
+            timeout=10
+        )
+
+        if response.status_code == 429:
+            app_logger.warning("Limite API IPinfo atteinte pour %s", ip)
+            return LIMIT
+
+        if response.status_code != 200:
+            app_logger.error(
+                "Erreur IPinfo pour %s : HTTP %d",
+                ip,
+                response.status_code
+            )
+            return None
+
+        data = response.json()
+
+        country = data.get("country")
+
+        if not country:
+            app_logger.warning("Pays introuvable pour %s", ip)
+            return "Unknown"
+
+        # 6. Enregistrer dans le cache mémoire
+        country_cache[ip] = country
+
+        # 7. Enregistrer dans PostgreSQL
+        saved = cache_db.save_ip(ip, country)
+
+        if saved:
+            app_logger.info(
+                "IP géolocalisée et sauvegardée : %s -> %s",
+                ip,
+                country
+            )
+
+        return country
+
     except http.RequestException as e:
-        logger.error("ipinfo %s : %s", ip, e)
+        app_logger.error("Erreur réseau pour %s : %s", ip, e)
         return None
 
-    if response.status_code == 429:
-        return LIMIT
-    if response.status_code != 200:
-        logger.error("ipinfo %s : http %d", ip, response.status_code)
+    except ValueError as e:
+        app_logger.error("Réponse JSON invalide pour %s : %s", ip, e)
         return None
 
-    data = response.json()
-    # private addresses (10.x, 127.x ...) are "bogon" and have no country
-    if data.get("bogon"):
-        country = "Private"
-    else:
-        country = data.get("country", "Unknown")
-
-    country_cache[ip] = country
-    return country
+    except Exception as e:
+        app_logger.error("Erreur géolocalisation %s : %s", ip, e)
+        return None
 
 
 def locate_all(ips):
-    # ips are sorted from the biggest attacker to the smallest,
-    # so if ipinfo blocks us the important ones are already located
-    new_ips = [ip for ip in ips if ip not in country_cache]
-    logger.info("%d ips, %d not in the cache", len(ips), len(new_ips))
+    """Géolocaliser les IP absentes du cache."""
+
+    new_ips = [
+        ip for ip in ips
+        if ip not in country_cache
+    ]
+
+    app_logger.info(
+        "%d IP au total, %d absentes du cache",
+        len(ips),
+        len(new_ips)
+    )
 
     for i, ip in enumerate(new_ips):
-        if geo_location(ip) == LIMIT:
-            logger.warning("ipinfo limit reached (429), %d ips stay Unknown, run again later",
-                           len(new_ips) - i)
-            break
 
-    save_cache()
+        result = geo_location(ip)
+
+        # Arrêter les appels si IPinfo répond 429
+        if result == LIMIT:
+            app_logger.warning(
+                "Limite API atteinte : %d IP restent à géolocaliser",
+                len(new_ips) - i
+            )
+            break

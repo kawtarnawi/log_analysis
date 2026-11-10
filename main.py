@@ -1,9 +1,14 @@
-
 import logging
 
 from ingestion import read
 from processing import analysis
 from processing import dashboard
+from processing import geolocation
+
+from storage import save_db
+from storage import cache_db
+
+from logger_config import app_logger
 
 
 if __name__ == "__main__":
@@ -13,23 +18,48 @@ if __name__ == "__main__":
         format="%(levelname)s:%(name)s:%(message)s"
     )
 
-    print("Reading log files...")
+    try:
+        print("Reading log files...")
 
-    rows = read.ingest("./data")
+        # 1. Initialisation des tables PostgreSQL
+        save_db.create_logs_table()
+        cache_db.create_cache_table()
 
-    print("Analyzing", len(rows), "lines...")
+        # 2. Chargement du cache depuis PostgreSQL
+        geolocation.initialize_cache()
 
-    successful, failed, invalid = analysis.analyze(rows)
+        # 3. Ingestion des fichiers
+        rows = read.ingest("./data")
 
-    print("\nSuccessful attempts by user:")
-    print(successful)
+        print("Analyzing", len(rows), "lines...")
 
-    print("\nFailed attempts by country:")
-    print(failed)
+        # 4. Analyse et géolocalisation
+        successful, failed, invalid, parsed_logs = analysis.analyze(rows)
 
-    print("\nFailed attempts with invalid user:")
-    print(sum(invalid.values()), "attempts,", len(invalid), "different usernames")
+        # 5. Sauvegarde des résultats finaux
+        save_db.save_logs(parsed_logs)
 
-    print("\nGenerating dashboard...")
+        # 6. Affichage des statistiques
+        print("\nSuccessful attempts by user:")
+        print(successful)
 
-    dashboard.show_dashboard(successful, failed, invalid)
+        print("\nFailed attempts by country:")
+        print(failed)
+
+        print("\nFailed attempts with invalid user:")
+        print(
+            sum(invalid.values()),
+            "attempts,",
+            len(invalid),
+            "different usernames"
+        )
+
+        # 7. Dashboard
+        print("\nGenerating dashboard...")
+
+        dashboard.show_dashboard(successful, failed, invalid)
+
+        app_logger.info("Pipeline terminé avec succès")
+
+    except Exception as e:
+        app_logger.error("Erreur pendant l'exécution du pipeline : %s", e)
